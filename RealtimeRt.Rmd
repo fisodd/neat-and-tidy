@@ -1,0 +1,554 @@
+---
+title: "Realtime Rt"
+subtitle: "Working with COVID-19 data using a port to Tidyverse of an interesting analysis developed in Python Scipy"
+author: "Alexander Carlton"
+date: "5/2/2020"
+output:
+  tufte::tufte_html:
+    tufte_variant: "envisioned"
+---
+
+```{r setup, include=FALSE}
+library(tufte)
+```
+
+```{marginfigure}
+Note: Kevin Systrom has since evolved his model
+to utilize far more involved tools, notably reworking the entire
+project to now be based on a
+[Markov chain Monte Carlo](https://en.wikipedia.org/wiki/Markov_chain_Monte_Carlo)
+method.
+Systrom's continuing work has been available in
+[a Github repository](https://github.com/k-sys/covid-19),
+but the origination for this side-project forked off of
+[an early version](https://github.com/k-sys/covid-19/blob/6beee9dac0a627da609537c9f3c59484f7fdb054/Realtime%20R0.ipynb)
+which I had found after stumbling across
+[a port to tidyverse by Ramnath Vaidyanathan](https://colab.research.google.com/drive/1iV1eRHaxirA--kmGIGbR1D67t8z8dUWN#scrollTo=wkFqlgDbgyZK).
+
+As always, I am indebted to my sources,
+and the reader is advised at assume that all the wisdom below
+comes from their insight, and any mistakes below are all mine.
+```
+
+One of the more approachable models coming out of COVID-19 analyses
+has been the [rt.live](https://rt.live/) project by Kevin Systrom.
+Systrom is a software guy, someone who studied virology not to
+understand biology but to understand the viral growth patterns
+of internet startups, so this approach may not be authoritative
+amongst the epidemiologists, but it does offer an interesting
+opportunity to view and appreciate the available case data.
+
+In the context of [neat and tidy](https://www.fisodd.com/code/neat-and-tidy/)
+this origin served as an interesting example of how to use
+a [tidyverse](https://www.tidyverse.org/) approach to mimic and
+then adapt a model originally developed with Python using Scipy.
+These analyses adapted well to the tidyverse, 
+offering a good example of one way to do a lot of computation
+within a neat and tidy approach.
+
+
+# Realtime Rt
+
+```{marginfigure}
+For background, read
+[The Metric We Need To Manage](http://systrom.com/blog/the-metric-we-need-to-manage-covid-19/)
+```
+                               
+The insight behind this project is that Bayesian statistics offers
+useful tools for appreciating the information behind what is published
+as case data, the daily counts of cases found for this disease.
+Notably, by working with the available counts of new infections each day
+it is possible to get some ideas about what is the effective reproduction rate,
+$R_t$, a measure for that point in the epidemic of how additional infections
+(on average) come from each infected person.
+Values of this $R_t$ notably above 1.0 suggest that each infection
+leads to an increase of cases in the future, and values below 1.0
+suggest that only some of the cases today will result in a new infection
+in the future and hence the epidemic may be easing.
+
+Specifically, Kevin Systrom cites a paper from 
+[a 2008 analysis of the avian flu](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0002185)
+that offers a Bayesian equation for estimating $R_t$,
+the effective reproduction rate,
+based on the available reports of cases of infection.
+As Systrom restates in the terminology of this analysis,
+$$ \lambda = k_{t-1}e^{\gamma(R_t-1)} $$
+Or in words, the Bayesian $\lambda$ can be understood as related to
+a calculation using yesterday's rate of new cases and $R_t$ value.
+
+## Setup
+
+### Configuration
+
+```{marginfigure}
+The serial interval is not an easy value to know.
+The right value can be difficult for experts to determine.
+In the early revisions Kevin Systrom references
+[one paper](https://wwwnc.cdc.gov/eid/article/26/6/20-0357_article)
+to support his use of a serial interval of 4,
+then in later updates he references
+[another paper](https://wwwnc.cdc.gov/eid/article/26/7/20-0282_article)
+to support his use of 7 for the serial interval.
+This project is mostly interested in comparative charts
+rather than predictive accuracy so for this work we will note that
+these guesses regarding the actual serial interval
+are going to change the magnitude of peaks and valleys of the charts 
+without making other notable changes to the shapes of the curves.
+```
+
+The key value for the calculation is this aforementioned $\gamma$,
+the reciprocal of what is known as the serial interval,
+which is the number of days (on average) between an individual
+gets infected with this virus and when that individual is in turn
+infecting others.
+
+
+```{r}
+# Serial Interval (avg days between being exposed until exposing others)
+SD <- 7
+
+# Gamma is 1/serial interval -- this value is used in the equations
+GAMMA <- 1/SD
+```
+
+The calculations will evaluate likelihoods over a range of possible
+values for $R_t$.
+This code uses a vector of values from 0 up through a `R_T_MAX` value.
+If that constant is too low then we may not evaluate the most likely values
+for $R_t$, and hence the reported estimates may be far from the right answers.
+If that value is too high then notable time will be spend evaluating
+potential values which are not helping at all to improve
+the accuracy of the work.
+The best values for `R_T_MAX` would be only somewhat higher than
+what is eventually discovered to be the most likely values for $R_t$.
+
+```{r}
+# r_t_range is a vector of possible values for R_t
+R_T_MAX <- 6
+r_t_range <- seq(0, R_T_MAX, length = R_T_MAX*100 + 1)
+```
+
+
+This code also uses a few variables to control some other aspects
+of the calculations.
+Most of these serve mainly to improve the aesthetics of the resulting charts.
+It is worth noting that the choice to smooth the inputs
+across the variations of a week's worth of reporting
+does stabilize the curves significantly,
+especially since the calculations using this $\lambda$ 
+are not simple when there are days with zero reported new cases.
+
+```{r}
+# WINDOW is how long to smooth over (in days)
+# ... 1 week covers weekend (lack of) reporting
+WINDOW <- 7
+# Note: used in both smoothing the input data
+# .. and as the the amount of time to include when estimating R_t
+
+# MIN_CASES is to skip past the uncertain starting periods
+MIN_CASES <- 3  
+# Choose a value large enough to get past when cases were rare and sporatic
+# ... will cause the resulting lines on the chart start a bit later
+# ... but may avoid some periods of absurdly high variance
+
+# FIRST_DATE is when to start the charts
+FIRST_DATE = "2020-03-02"
+# Depending on the data used, choice of a FIRST_DATE may clean up charts
+```
+
+
+### Environment
+
+```{r, message=FALSE}
+library(tidyverse)
+library(smoother)
+library(slider)
+library(lubridate)
+```
+
+The `tidyverse` is used for most of the heavy lifting here.
+
+The `smoother` library offers a clean way to smooth our inputs within
+a single line in a `mutate()` call.
+
+The `slider` library is a recent addition to my workflow,
+added because it provides a nice and clean method to
+control just how I want my sliding windows to work.
+
+And `lubridate` just because it's really handy to work
+in `days()` rather than "rows"...
+
+
+## Inputs
+
+This implementation will take advantage of
+the data provided by the CSSE folks at Johns Hopkins,
+the same data used for the other Neat-and-Tidy bits.
+
+```{marginfigure}
+The Neat-and-Tidy project keeps the 
+[Johns Hopkins CSSE COVID-19 data](https://github.com/CSSEGISandData/COVID-19)
+in a "COVID-19" subdirectory.
+Also, since the the Johns Hopkins US data is supplied at the county level,
+for simplication we sum up the county-level data to get statewide totals.
+```
+
+```{r}
+jhu_directory <- "COVID-19/csse_covid_19_data/csse_covid_19_time_series/"
+jhu_states_filename <- "time_series_covid19_confirmed_US.csv"
+jhu_states_cols <- cols(
+    .default = col_double(),
+    UID = col_character(),
+    iso2 = col_character(),
+    iso3 = col_character(),
+    FIPS = col_character(),
+    Admin2 = col_character(),
+    Province_State = col_character(),
+    Country_Region = col_character(),
+    Combined_Key = col_character()
+)
+
+input_data <- read_csv(
+    paste0(jhu_directory, jhu_states_filename),
+    col_types = jhu_states_cols
+) %>%
+    select(
+        -UID, -iso2, -iso3, -code3, -Lat, -Long_, -FIPS,
+        -Combined_Key
+    ) %>%
+    rename(
+        State = "Province_State",
+        Country = "Country_Region"
+    ) %>%
+    pivot_longer(
+        -c(Admin2, State, Country),
+        names_to = "date_str",
+        values_to = "cases"
+    ) %>%
+    filter(State %in% state.name) %>%
+    group_by(State, date_str) %>%
+    summarise(total = sum(cases)) %>%
+    mutate(
+        entity = State,
+        date = as.Date(date_str, "%m/%d/%y"),
+        cases = total
+    ) %>%
+    ungroup() %>%
+    select(-State, -date_str, -total)
+```
+
+
+## Some Functions
+
+The `prepare_data()` function is called once on the data after it
+has been loaded. basically this is where we "smooth" the data to
+avoid the differences between weekend and weekday reports.
+This function also weeds out parts of the data that are
+a) to old, b) too few, c) too short to be worth processing.
+
+```{r}
+prepare_data <- function(data) {
+    # given a tibble with "date", "entity", and "cases"
+    # return a tibble adding "new": difference between day and day-before
+    # ... and adding "value": gaussian smoothed values of new, rounded
+    
+    if (exists("FIRST_DATE") && !is.null(FIRST_DATE)) {
+        data <- data %>%
+            filter(date >= FIRST_DATE)
+    }
+    if (exists("MIN_CASES") && !is.null(MIN_CASES)) {
+        data <- data %>%
+            filter(cases > MIN_CASES)
+    }
+    data %>%
+        group_by(entity) %>%
+        # Find and drop entities with too few dates
+        mutate(len = length(date)) %>%
+        filter(len > WINDOW) %>%
+        # Sort by date to support a smoothing window
+        arrange(date) %>%
+        mutate(
+            # diff() returns n-1 items, hack in an initial value...
+            new = c(cases[1], diff(cases)),
+            # Gaussian smoother rounded back to discrete values
+            k = round(
+                smth.gaussian(new, window = WINDOW, tails = TRUE)
+            )
+        ) %>%
+        ungroup() %>%
+        select(-len)
+}
+```
+
+
+The `compute_likelihood()` function is called to generate
+likelihood probabilities for each date in the data
+across all the values of $R_t$ we think are worth evaluating.
+We make a separate call to this function for each set of
+location data, so one entity at a time, which does simplify
+some of the `group_by()` calls.
+
+```{r}
+compute_likelihood <- function(data) {
+    # given a tibble with "date" and "value" (smoothed case values)
+    # return a tibble of likelihoods
+    
+    data %>% 
+        arrange(date) %>%
+        crossing(val = r_t_range) %>%
+        group_by(val) %>%
+        mutate(
+            lag = lag(k, 1),
+            lambda = lag(k, 1) * exp(GAMMA * (val - 1)),
+            log_likelihood_r_t = dpois(k, lambda, log = TRUE)
+        ) %>%
+        filter(
+            # drop first date since its lamda value is weak
+            date > min(date)
+        ) %>%
+        ungroup() %>%
+        select(
+            -lambda
+        )
+}
+```
+
+
+The `compute_posterior()` function uses the likelihood
+probabilities to calculate posterior values.
+Note: there is a bit of arithmetic trickery below,
+this code uses a sum of log values 
+rather than a product of the base values.
+
+```{r}
+compute_posterior <- function(data) {
+    # Given a tibble with "date" and "log_likelihood_r_t"
+    # return a tibble with posteriors
+    
+    data %>%
+        arrange(date) %>%
+        group_by(val) %>%
+        mutate(
+            posterior = exp(
+                slide_index_dbl(
+                    log_likelihood_r_t,
+                    date,
+                    sum,
+                    .before = days(WINDOW - 1),
+                    .complete = FALSE
+                )
+            )
+        )
+}
+```
+
+
+The `calc_interval()` function is not very "R like",
+it's a quick-and-dirty utility function
+to run through a vector of probabilities in order to
+find a reasonably small interval that covers the specified interval.
+
+```{r}
+
+calc_interval <- function(vals, probs, ci=0.95) {
+    # Given a vector of values and it's vector of probabilities
+    # return a list of most-likely value and a hi/lo interval
+    
+    # We find a reasonable interval, not the optimal interval
+    # ... but this method runs within linear time
+    
+    sum <- sum(probs, na.rm = TRUE)
+    if (sum == 0) {
+        # then we have a problem, there are no probabilities...
+        # ... but rather than error out, we'll return zeros...
+        ml <- 0
+        lo <- 0
+        hi <- 0
+    } else {
+        # key: use an array of cumulative sum of normalized values, so
+        # difference in values between two points is the interval there
+        cum <- cumsum(probs / sum)
+        len <- length(cum)
+
+        # start looking at the point of maximal probability
+        idx_ml <- which.max(probs)
+        idx_lo <- idx_ml
+        idx_hi <- idx_ml
+        
+        for (count in 1:len) {
+            # How big an interval do we have so far?
+            sum <- cum[idx_hi] - cum[idx_lo]
+            if (sum >= ci) {
+                # We've found an interval wide enough, stop looking
+                break
+            }
+            
+            # not wide enough yet, expand the interval one step
+            if (idx_lo == 1) {
+                # can't go lower, must go higher
+                if (idx_hi == len) {
+                    # but can't go higher, we're done
+                    break
+                } else {
+                    idx_hi <- idx_hi + 1
+                }
+            } else {
+                if (idx_hi == len) {
+                    # can't go higher, so step open lower
+                    if (idx_lo == 1) {
+                        # but also already at bottom, we're done
+                        break
+                    } else {
+                        idx_lo <- idx_lo - 1
+                    }
+                } else {
+                    # both directions are possible...
+                    # be greedy, check which direction gives us more
+                    nxt_lo <- idx_lo - 1
+                    nxt_hi <- idx_hi + 1
+                    gap_lo <- probs[nxt_lo]
+                    gap_hi <- probs[nxt_hi]
+                    if (gap_hi > gap_lo) {
+                        idx_hi <- nxt_hi
+                    }
+                    if (gap_lo > gap_hi) {
+                        idx_lo <- nxt_lo
+                    }
+                    if (gap_lo == gap_hi) {
+                        # not common save for 0 probabilities, but...
+                        # at least go a different direction each time
+                        if (count %% 2 == 1) {
+                            idx_lo <- nxt_lo
+                        } else {
+                            idx_hi <- nxt_hi
+                        }
+                    }
+                }
+            }
+        }
+        ml <- vals[idx_ml]
+        lo <- vals[idx_lo]
+        hi <- vals[idx_hi]
+    }
+    list("ml" = ml, "lo" = lo, "hi" = hi)
+}
+```
+
+The final `estimate_rt()` function then becomes the simplest,
+but we maintain the function abstraction for a regularized workflow.
+Basically, for each date, call a function to report back
+the "most likely" value, and either end of a 95% confidence interval.
+
+The likelihood calculations end up with fairly narrow distributions
+so often even a very high "confidence" levels still result in narrow bands.
+
+```{r}
+estimate_rt <- function(data) {
+    # Given a tibble with "date", "entity", and "cases"
+    # ... crossed with "r_t" and "posterior"
+    # return a tibble adding most_likely and hi/lo estimates for R_t
+
+    data %>%
+        group_by(entity, date, cases) %>%
+        summarize(
+            list = list(calc_interval(val, posterior)),
+            r_t_most_likely = list[[1]]$ml,
+            r_t_interval_lo = list[[1]]$lo,
+            r_t_interval_hi = list[[1]]$hi
+        ) %>%
+        select(
+            -list
+        )
+}
+```
+
+
+## Operation
+
+The actual operation then is rather straight forward.
+
+Prep the data, then split the data apart based on the location,
+and for each split: compute likelihoods and then posteriors
+and finally grab the most likely values for $R_t$ from the posteriors.
+
+```{r}
+r_t_estimates <- input_data %>%
+    prepare_data() %>%
+    group_by(entity) %>%
+    group_split() %>%
+    map_df(~ {
+        .x %>%
+            compute_likelihood() %>%
+            compute_posterior() %>%
+            estimate_rt()
+    }) %>%
+    ungroup()
+```
+
+The code above is one example of where a `tidyverse` approach
+enables a whole lot of calculations to be elegantly expressed.
+
+## Display
+
+```{r, fig.fullwidth=TRUE, fig.width=10}
+g <- r_t_estimates %>%
+    ggplot(
+        aes(
+            x = date, 
+            y = r_t_most_likely,
+            color = r_t_most_likely
+        )
+    ) +
+    geom_point(
+        size = 0.95,
+        alpha = 0.8
+    ) +
+    scale_color_viridis_c(direction = 1) +
+    geom_hline(yintercept = 1, linetype = 'dashed', color = "red") +
+    geom_ribbon(
+        aes(
+            ymin = r_t_interval_lo, 
+            ymax = r_t_interval_hi, 
+            color = NULL, group = NULL
+        ),
+        fill = 'gray20',
+        alpha = 0.2
+    ) +
+    scale_x_date(
+        date_breaks = "2 weeks",
+        date_labels = "%b-%d"
+    ) +
+    coord_cartesian(ylim = c(0, 4)) +
+    facet_wrap(~entity) +
+    guides(
+        color = guide_colorbar(title = expression('R'[t]))
+    ) +
+    labs(
+        title = expression('Estimates of Rates of Transmission over Time: R'[t]),
+        subtitle = paste(
+            "Estimates of an effective reproduction number by locality over time,",
+            "assuming a serial interval of",
+            SD,
+            "days."
+        ),
+        x = NULL,
+        y = expression(paste(
+            "Estimate of current R"[t], ", with line at 1.0",
+            "(below suggests decelerating cases)"
+        )),
+        caption = paste(
+            "Visual by Alexander Carlton,",
+            "Math from Kevin Systrom,",
+            "Data from JHU CSSE"
+        )
+    ) +
+    theme_minimal() +
+    theme(
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5)
+    )
+
+print(g)
+```

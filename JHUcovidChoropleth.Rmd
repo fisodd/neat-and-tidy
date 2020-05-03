@@ -1,0 +1,401 @@
+---
+title: "Neat and Tidy: Mapping COVID-19 Data with Tidyverse"
+subtitle: "Animating choropleths with 'urbnmapr' and 'gganimate'"
+author: "Alexander Carlton"
+date: "2020-04-13"
+output:
+  tufte::tufte_html:
+    tufte_variant: "envisioned"
+---
+```{r setup, include=FALSE}
+library(tufte)
+```
+
+```{marginfigure}
+This page is part of a
+[Neat and Tidy](https://www.fisodd.com/code/neat-and-tidy)
+project with multiple articles on different ways to use
+the [Tidyverse](https://www.tidyverse.org/) to manage
+real world data.
+```
+
+COVID-19 has triggered many questions.
+One of the most basic questions with any viral outbreak is "Where?"
+
+The good folks at the Johns Hopkins University CSSE 
+provide one of the commonly sited views of the current COVID-19
+situation, https://coronavirus.jhu.edu/map.html
+
+But since these folks also have released their data via GitHub,
+https://github.com/CSSEGISandData/COVID-19,
+everyone can create customized views into this information
+and produce maps to suit their specific interests.
+
+
+# Set Up
+
+## Environment
+
+```{marginfigure}
+A good tool improves the way you work.
+A great tool improves the way you think.
+
+-- Jeff Duntemann
+```
+
+```{r env, results='hide', message=FALSE}
+library(tidyverse)
+library(gganimate)
+library(urbnmapr)
+library(scales)
+library(gifski)
+```
+
+## Configuration
+
+A few parameters for controling or adapting this script
+to suit the local needs.
+
+```{r config}
+# This file will be created at the end
+output_filename <- "animation.gif"
+
+# The following are based on the local copy of the data
+jhu_directory <- "COVID-19/csse_covid_19_data/csse_covid_19_time_series/"
+jhu_cases_filename <- "time_series_covid19_confirmed_US.csv"
+jhu_death_filename <- "time_series_covid19_deaths_US.csv"
+
+# Minimum population to include in map (tiny populations can have difficult variance)
+min_pop <- 10000
+```
+
+
+# Inputs
+
+Amongst the many files provided in this repository,
+our immediate focus are the time_series files,
+specifically the ones for the US:
+the one tracking Confirmed Cases
+and the one tracking Deaths.
+
+```{marginfigure}
+The [COVID-19 repository](https://github.com/CSSEGISandData/COVID-19)
+is a great resource for sane, fresh data on a very difficult problem.
+Their Center for Systems Science and Engineering (JHU CSSE) has become
+famous for [their dashboard](https://coronavirus.jhu.edu/map.html),
+but making the raw data available on
+[their GitHub](https://github.com/CSSEGISandData/COVID-19) has enabled
+so many others to learn.  We are very grateful.
+```
+
+```{r inputs}
+# Fetch JHU data
+jhu_cols <- cols(
+    .default = col_double(),
+    UID = col_character(),
+    iso2 = col_character(),
+    iso3 = col_character(),
+    FIPS = col_character(),
+    Admin2 = col_character(),
+    Province_State = col_character(),
+    Country_Region = col_character(),
+    Combined_Key = col_character()
+)
+
+# Fetch the Cases and then the Death data
+jhu_cases_data <- read_csv(
+    paste0(jhu_directory, jhu_cases_filename),
+    col_types = jhu_cols
+) %>%
+    select(
+        -UID, -iso2, -iso3, -code3, -Lat, -Long_, -Country_Region
+    ) %>%
+    rename(
+        County = "Admin2",
+        State = "Province_State"
+    )
+jhu_death_data <- read_csv(
+    paste0(jhu_directory, jhu_death_filename),
+    col_types = jhu_cols
+) %>%
+    select(
+        -UID, -iso2, -iso3, -code3, -Lat, -Long_, -Country_Region
+    ) %>%
+    rename(
+        County = "Admin2",
+        State = "Province_State"
+    )
+```
+
+The data in these time_series files has new columns added each day.
+For our use here we need to transform these spreadsheets into tidy data.
+
+While we are at it, we process the "FIPS" values (which are a set of
+standardized labels for each county in the US) into a form that
+makes life much easier later, when we join with our mapping points.
+
+```{r make-tidy}
+# Turn the JHU data into a 'tidy' form (with a proper Date field)
+tidy_cases_data <- jhu_cases_data %>% 
+    pivot_longer(
+        -c(County, State, Combined_Key, FIPS),
+        names_to = "date_str",
+        values_to = "Cases"
+    ) %>%
+    mutate(
+        Date = as.Date(date_str, "%m/%d/%y"),
+        date_str = NULL,
+        county_fips = sprintf("%05d", as.integer(FIPS)),
+        FIPS = NULL
+    )
+tidy_death_data <- jhu_death_data %>% 
+    pivot_longer(
+        -c(County, State, Combined_Key, Population, FIPS),
+        names_to = "date_str",
+        values_to = "Death"
+    ) %>%
+    mutate(
+        Date = as.Date(date_str, "%m/%d/%y"),
+        date_str = NULL,
+        county_fips = sprintf("%05d", as.integer(FIPS)),
+        FIPS = NULL
+    )
+```
+
+Then once we have the data in tidy form,
+it is easy to manipulate it into what we need.
+
+Joining the Cases and the Deaths together allows an analysis of morbidity,
+but in this case it also happens to bring in a column of Population data
+from the Deaths file that is very useful for the Cases data.
+
+```{r joining}
+# Joining also gives us a Population field to use
+tidy_data <- tidy_cases_data %>%
+    left_join(
+        tidy_death_data, 
+        by = c("County", "State", "Combined_Key", "county_fips", "Date")
+    )
+```
+
+# Operate
+
+Since we are focused on mapmaking, we can remove the entries that don't
+fit into our maps.
+
+```{marginfigure}
+Yes, there's a degree of inaccuracy created by just
+dropping the data out, but at the scales being used here the "unassigned"
+and out-of-state cases are not significant enough to change the picture.
+*Note:* this assumption is not safe, and needs to be tested before one
+does any serious analysis.
+```
+
+```{r operate}
+dataset <- tidy_data %>%
+    filter(
+        !County == "Unassigned",
+        !str_detect(County, "Out of "),
+        Population > min_pop # Drops the cruise ships and tiny principalities
+    ) %>%
+    mutate(
+        value = if_else(
+            Cases != 0,
+            Cases / (Population / 1000000),
+            NA_real_  # For display purposes, convert '0' to 'na' (white out)
+        )
+    )
+```
+
+Having made the (gross) simplification
+of dropping out the problematic elements,
+we can now focus on making maps.
+
+First step is to generate a minimal dataset,
+stripping out anything not used in these maps.
+
+The size of the tibbles multiplies quickly
+when we join with all the map points,
+so the more we can eliminate now
+the less stuff the plot needs to grind through
+when making each image.
+Something that can be appreciated when we
+need to grind through a hundred images
+to make an animation.
+
+```{r minimize}
+# Note: these could be customized...
+start_date <- min(dataset$Date)
+end_date <- max(dataset$Date)
+
+# join desired data with map points and then drop the unneeded cols
+mapset <- dataset %>%
+    filter(
+        Date >= start_date,
+        Date <= end_date
+    ) %>%
+    mutate(
+        region = tolower(State),
+        subregion = tolower(County)
+    ) %>%
+    select(
+        -Combined_Key,
+        -County, -State,
+        -Cases, -Death, -Population
+    )
+```
+
+The last operation is to join in the map points.
+
+```{marginfigure}
+Again, we are working the potentially sharp edges of the boundaries
+between accuracy and usefulness.
+```
+
+For this exercise the county-level information as provided by
+`urbnmapr` (the very handy US map assistant from the Urban Institute team)
+provides just what we need [border points to draw at both the county
+and at the state level precalculated with a transform that pulls
+Alaska and Hawaii across the Pacific to nestle in where the real world
+has Baja California -- not necessarily accurate, but effective and
+very recognizable for a US audience].
+
+
+```{r mapinfo}
+mapinfo <- mapset %>%
+    right_join(urbnmapr::counties, by = "county_fips")
+```
+
+# Display
+
+Lots of functions with lots of arguments,
+but mostly this is just for style.
+
+The one tricky item here is the coloring of the counties.
+This chart uses `scale_fill_viridis_c` for coloring,
+but here we specify a "log10" transformation
+(linear distance along this color line represents changes of
+orders of magnitude in cases per million in population)
+so that the few locations with very high rates
+don't force everywhere else into a dull monotone.
+
+```{marginfigure}
+As was touched on when dropping the "unassigned" values above,
+this is another area where one needs to be careful.
+The `log10` function is an exaggeration, and while exaggeration is a powerful
+tool to pull attention to the selected area of interest,
+there comes a point where it is difficult (if not impossible)
+to differentiate between an overdone exaggeration and a simple lie.
+```
+
+```{r ggplot}
+# Use the last date with values as a proxy for a timestamp for the dataset
+last_date <- max(tidy_data$Date)
+
+# Build the plot
+g <- ggplot() +
+    # County-level data
+    geom_polygon(
+        data = mapinfo,
+        mapping = aes(x = long, y = lat, group = group, fill = value),
+        color = NA
+    ) +
+    # Colored brightly
+    scale_fill_viridis_c(
+        name = "Cases per Million",
+        trans = "log10", # bring out differences of less afflected counties
+        n.breaks = 5,
+        labels = label_comma(),
+        na.value = "white",
+        option = "C"
+    ) +
+    # State outlines
+    geom_polygon(
+        data = urbnmapr::states,
+        mapping = aes(long, lat, group = group),
+        fill = NA,
+        color = "black",
+        size = 0.4
+    ) +
+    # projected in a reasonable manner for a decent map
+    coord_map("albers", lat0 = 45.5, lat1 = 29.5) +
+    scale_x_continuous(breaks = NULL) +
+    scale_y_continuous(breaks = NULL) +
+    # Hack the legend to be wide across the bottom of the chart
+    guides(
+        fill = guide_colorbar(
+            barwidth = unit(0.666, "npc"),
+            barheight = unit(0.01, "npc")
+        )
+    ) +
+    # Labels (with "frame_time" to be supplied by gganimate below)
+    labs(
+        title = "Rate of Confirmed COVID-19 Cases By County",
+        subtitle = "Cases per Million Population as of {frame_time}",
+        caption = paste("Data from Johns Hopkins University CSSE,", last_date),
+        x = NULL,
+        y = NULL
+    ) +
+    # Clean theme, but do push the legend/guide to be displayed below chart
+    theme_minimal() +
+    theme(
+        legend.title = element_text(vjust = 1),
+        legend.position = "bottom"
+    ) 
+print(g)
+```
+
+And we have our base chart.
+
+Yes, it looks very bare with only one reported case in Washington.
+But that's only how things started, the map will look very different
+as we move forward in time.
+
+# Animate
+
+Now that we have the base chart,
+with the `gganimate` library
+animation has been made very easy.
+Effectively all we need to do
+is to declare what is the variable we are using to step
+through the dataset, and then just specify a few basic
+parameters in the call to animate -- here the parameters
+are basically the default with the one exception of
+specifying that we will end the animation loop by
+displaying the (unchanging) final image for the last
+three seconds before repeating.
+
+The one trick here is that we've chosen to use "{frame_time}"
+in the subtitle for the chart so that during animation this
+will be replaced by the current date as is generated by the
+`transition_time()` function.
+
+```{r anim, results='hide', message=FALSE, warning=FALSE}
+# Note: this can take a while to execute
+# -- many days of data
+# -- lots and lots of (border) points in every image
+
+# Animate by Date
+anim <- g +
+    transition_time(Date, range = c(start_date, end_date))
+loop <- animate(
+    anim,
+    nframes = 100, fps = 10, # 10 second clip
+    end_pause = 30 # hold still for last 30 frames (3 secs)
+)
+anim_save(output_filename)
+```
+
+All of which produces this animation.
+
+```{marginfigure}
+"How did you go bankrupt?" Bill asked.
+
+"Two ways," Mike said. "Gradually and then suddenly."
+
+-- Ernest Hemmingway, *The Sun Also Rises*
+```
+
+```{r loop}
+loop
+```
