@@ -4,6 +4,9 @@ https://www.tidyverse.org.
 Based on the COVID-19 data
 provided by the CSSE team at Johns Hopkins University,
 https://github.com/CSSEGISandData/COVID-19.
+  
+These examples are discussed in a
+[blog post](https://www.fisodd.com/code/neat-and-tidy).
 
 ## Small Multiples
 
