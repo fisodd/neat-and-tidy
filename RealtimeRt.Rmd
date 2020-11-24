@@ -2,7 +2,7 @@
 title: "Realtime Rt"
 subtitle: "Working with COVID-19 data using a port to Tidyverse of an interesting analysis developed in Python Scipy"
 author: "Alexander Carlton"
-date: "5/2/2020"
+date: "2020-05-02, Updated 2020-11-02"
 output:
   tufte::tufte_html:
     tufte_variant: "envisioned"
@@ -151,9 +151,9 @@ MIN_CASES <- 3
 # ... will cause the resulting lines on the chart start a bit later
 # ... but may avoid some periods of absurdly high variance
 
-# FIRST_DATE is when to start the charts
+# Depending on the data used, choice of dates may clean up charts
 FIRST_DATE = "2020-03-02"
-# Depending on the data used, choice of a FIRST_DATE may clean up charts
+LAST_DATE = "2020-05-02"
 ```
 
 
@@ -161,9 +161,10 @@ FIRST_DATE = "2020-03-02"
 
 ```{r, message=FALSE}
 library(tidyverse)
-library(smoother)
-library(slider)
 library(lubridate)
+library(smoother)
+library(geofacet)
+library(slider)
 ```
 
 The `tidyverse` is used for most of the heavy lifting here.
@@ -177,6 +178,8 @@ control just how I want my sliding windows to work.
 
 And `lubridate` just because it's really handy to work
 in `days()` rather than "rows"...
+
+Finally, `geofacet` is used to improve the layout of the display.
 
 
 ## Inputs
@@ -227,7 +230,10 @@ input_data <- read_csv(
     ) %>%
     filter(State %in% state.name) %>%
     group_by(State, date_str) %>%
-    summarise(total = sum(cases)) %>%
+    summarise(
+        total = sum(cases),
+        .groups = "drop_last"
+    ) %>%
     mutate(
         entity = State,
         date = as.Date(date_str, "%m/%d/%y"),
@@ -255,6 +261,10 @@ prepare_data <- function(data) {
     if (exists("FIRST_DATE") && !is.null(FIRST_DATE)) {
         data <- data %>%
             filter(date >= FIRST_DATE)
+    }
+    if (exists("LAST_DATE") && !is.null(LAST_DATE)) {
+        data <- data %>%
+            filter(date <= LAST_DATE)
     }
     if (exists("MIN_CASES") && !is.null(MIN_CASES)) {
         data <- data %>%
@@ -344,7 +354,8 @@ compute_posterior <- function(data) {
 
 
 The `calc_interval()` function is not very "R like",
-it's a quick-and-dirty utility function
+but it gets the job relatively effectively.
+This is a quick-and-dirty utility function
 to run through a vector of probabilities in order to
 find a reasonably small interval that covers the specified interval.
 
@@ -360,7 +371,7 @@ calc_interval <- function(vals, probs, ci=0.95) {
     sum <- sum(probs, na.rm = TRUE)
     if (sum == 0) {
         # then we have a problem, there are no probabilities...
-        # ... but rather than error out, we'll return zeros...
+        # so, return all zeros...
         ml <- 0
         lo <- 0
         hi <- 0
@@ -430,6 +441,7 @@ calc_interval <- function(vals, probs, ci=0.95) {
         lo <- vals[idx_lo]
         hi <- vals[idx_hi]
     }
+
     list("ml" = ml, "lo" = lo, "hi" = hi)
 }
 ```
@@ -450,11 +462,12 @@ estimate_rt <- function(data) {
 
     data %>%
         group_by(entity, date, cases) %>%
-        summarize(
+        summarise(
             list = list(calc_interval(val, posterior)),
             r_t_most_likely = list[[1]]$ml,
             r_t_interval_lo = list[[1]]$lo,
-            r_t_interval_hi = list[[1]]$hi
+            r_t_interval_hi = list[[1]]$hi,
+            .groups = "drop_last"
         ) %>%
         select(
             -list
@@ -490,8 +503,19 @@ enables a whole lot of calculations to be elegantly expressed.
 
 ## Display
 
+Showing results for 50 different states in one visualization often
+makes for a difficult experience.  However, since most of the audience
+for US data can readily recognize a map of the country, using `geofacet`
+to layout the charts like a map can help lower the initial cognative load.
+
+Note: `geofacet` supports a wide variety of layouts including support
+for custom maps.  One example of a different US layout is included in
+the associated article on
+[small multiples](/work/neat-and-tidy/small-multiples/).
+
+
 ```{r, fig.fullwidth=TRUE, fig.width=10}
-g <- r_t_estimates %>%
+gg <- r_t_estimates %>%
     ggplot(
         aes(
             x = date, 
@@ -519,7 +543,10 @@ g <- r_t_estimates %>%
         date_labels = "%b-%d"
     ) +
     coord_cartesian(ylim = c(0, 4)) +
-    facet_wrap(~entity) +
+    facet_geo(
+        ~ entity,
+        move_axes = FALSE
+    ) +
     guides(
         color = guide_colorbar(title = expression('R'[t]))
     ) +
@@ -550,5 +577,5 @@ g <- r_t_estimates %>%
         axis.text.x = element_text(angle = 90, vjust = 0.5)
     )
 
-print(g)
+print(gg)
 ```

@@ -2,7 +2,7 @@
 title: "Clean and Tidy: Using Tidyverse to Manage COVID-19 Data"
 subtitle: "Generating Small-Multiple Charts of Cases in the US Using the JHU CSSE COVID-19 Dataset"
 author: "Alexander Carlton"
-date: "2020-04-09"
+date: "2020-04-09, Updated 2020-11-01"
 output:
     tufte::tufte_html:
         tufte_variant: "envisioned"
@@ -21,8 +21,7 @@ especially well managed, timely data.
 The good folks at the Johns Hopkins University 
 Center for Systems Science and Engineering (JHU CSSE)
 have provided one of the most obvious early examples
-of an immediately useful dataset -- and wonderfully
-they have
+of an immediately useful dataset -- and wonderfully they have
 [shared it all openly](https://github.com/CSSEGISandData/COVID-19)
 so that everyone can work with the numbers
 until we each find the best ways to make sense of all this.
@@ -35,34 +34,31 @@ learned as have explored the power of the
 ```
 
 This write-up comes from one of my own learning exercises
-using the powerful tools of the
-`tidyverse` library for the `R` environment.
+using the powerful tools of the `tidyverse` library for the `R` environment.
 The author is lifelong student who has recently found the Tidyverse
 to be an effective means of working with and displaying this data.
-There are no insightful analyses here, this is just a review of 
-one attempt to use tidyverse functions to do good work
-with an interesting dataset.
+Note, this is not meant to be a work of indepth analysis,
+this is just a review of one attempt to use tidyverse functions
+to do good work with an interesting dataset.
 
-The original goal was to compare how my local community
-(one of the earliest with confirmed cases of COVID-19) 
-was comparing to others around the country.
-The intention was to build a 
+Our goal is to look at how COVID is affecting different states
+across the US.  The intention was to build a 
 [small-multiple](https://en.wikipedia.org/wiki/Small_multiple)
-graphic that
-allowed me to compare caseload curves and also appreciate the 
-differences (if any) between large and small communities.
+graphic that allowed me to compare caseload curves
+and also appreciate the differences (if any) all around the country.
 
 
 # Setup
 
-There are some assumptions built into any working code.
+As always, there are some assumptions built into any working code.
 Perhaps the details of the setup used here
 can provide some idea of the assumptions
 that underlie this code.
 
 ## Configuration
 
-The values below can be configured to adapt to the local needs.
+The key configuration variable is the path to the local copy of the data,
+but other values below can be configured to experiment with alternative views.
 
 ### Local Files
 
@@ -79,27 +75,42 @@ underneath the `COVID-19` directory.
 
 ```{r, setup-inputs, results='hide'}
 # The following are based on the local copy of the data
-jhu_directory <- "COVID-19/csse_covid_19_data/csse_covid_19_time_series/"
-jhu_cases_filename <- "time_series_covid19_confirmed_US.csv"
-jhu_death_filename <- "time_series_covid19_deaths_US.csv"
+jhu_directory <- "COVID-19/csse_covid_19_data/"
 ```
 
-### Display Parameters
+### Script Parameters
 
-In this case we are defining a couple of variables
-that can be used to adjust the details of the resulting chart.
+For our visualization we are defining a couple of variables
+that can be used to adjust the look of the resulting chart.
 
-```{r, setup-display, results='hide'}
-min_pop <- 10000      # can be useful to exclude tiny entities with wide variances
-max_counties <- 25    # how many facets at most, square values look best
+A 7-day moving average does serve to smooth the lines, but 
+the choice of seven days is meant to minimize weekday-vs-weekend
+differences in reporting affecting the views.
+
+The upper-bound variable is used as part of the calculations
+to normalize the views of each chart in the set.  Each state's result
+are mapped to a value relative to that state's latest result.
+Then our visualization will display a set of charts running from
+zero to this upper bound so that the shapes of the curves are comparable.
+
+```{r, setup-parameters, results='hide'}
+# Size of the moving window for averaging
+DESIRED_DAYS <- 7
+before_count <- DESIRED_DAYS - 1
+
+# Upper Bound of Y-Axis
+UPPER_BOUND <- 2
 ```
 
 ## Environment
 
 The `tidyverse` library is the main dependency.
-`lubridate` is used so we can `lag()` to fetch values from the day before.
-The `scales` library is used for a minor touch 
-to make the legend a tiny bit easier to read.
+The `slider` library does the hard work of
+proper calculations of moving averages.
+We use `lubridate` just to get a trivial way to calculate "one month ago".
+`ggrepel` helps make labels in each chart simple as well as easy to execute.
+Finally, `geofacet' provides an interesting way to layout the many charts
+in this visualization.
 
 ```{marginfigure, see-further}
 "If I have seen further it is by standing on the shoulders of Giants"
@@ -109,7 +120,9 @@ to make the legend a tiny bit easier to read.
 ```{r, env, results='hide', message=FALSE}
 library(tidyverse)
 library(lubridate)
-library(scales)
+library(geofacet)
+library(ggrepel)
+library(slider)
 ```
 
 
@@ -119,11 +132,12 @@ This particular analysis is based on the time-series
 provided for the US, which has day by day values for
 cumulative confirmed cases categorized by state and county.
 
-These files have several columns which define or label the counties,
+These files have several columns which define or label the locations,
 and then a bunch of columns for the values (one column for each date).
 
 ```{r, input-cols}
-jhu_cols <- cols(
+jhu_uscases_filename <- "csse_covid_19_time_series/time_series_covid19_confirmed_US.csv"
+jhu_uscases_cols <- cols(
     .default = col_double(),
     iso2 = col_character(),
     iso3 = col_character(),
@@ -136,6 +150,9 @@ jhu_cols <- cols(
 
 To make this data useful for the tidyverse functions,
 once it is read in we transform into a "tidy" data format.
+We also do a relatively trivial summarization to calculate case totals
+for each state, and once that's done we simplify the dataset down
+to just the few items we need.
 
 ```{marginfigure, pivot}
 Some may find the [tidy](https://r4ds.had.co.nz/) 
@@ -150,281 +167,181 @@ for me this makes the entire `tidyverse` much easier to approach.
 ```
 
 ```{r, input-cases}
-cases_data <- read_csv(
-    paste0(jhu_directory, jhu_cases_filename),
-    col_types = jhu_cols
+jhu_uscases_data <- read_csv(
+    paste0(jhu_directory, jhu_uscases_filename),
+    col_types = jhu_uscases_cols
 ) %>%
+    # Drop the fields we are not going to use, simplify a couple of names
     select(
         -UID, -iso2, -iso3, -code3,
         -Lat, -Long_,
-        Country = "Country_Region",
-        State = "Province_State",
-        County = Admin2
+        Admin0 = "Country_Region",
+        Admin1 = "Province_State"
     ) %>%
-    select(-Country) %>%  # Country always == "US" in this dataset
+    # Convert the raw data into a tidy form
     pivot_longer(
-        -c(FIPS, County, State, Combined_Key),
+        -c(FIPS, Admin0, Admin1, Admin2, Combined_Key),
         names_to = "date_str",
         values_to = "Cases"
     ) %>%
     mutate(
         Date = as.Date(date_str, "%m/%d/%y"),
         date_str = NULL
+    ) %>%
+    # Calculate statewide totals
+    group_by(Admin0, Admin1, Date) %>%
+    summarise(StateTotal = sum(Cases), .groups = "drop_last") %>%
+    rename(Cases = StateTotal) %>%
+    # Reduce to just the info we need
+    ungroup() %>%
+    select(
+        Admin1, Date, Cases
     )
 ```
 
-We perform the same steps on a related file
-which contains the cumulative counts of COVID-19 related deaths.
+To aid comparisons between different states it can be useful to
+normalize case counts by the population of each state, for this I use
+purpose the number of cases per million of population in the state.
 
-*Note:* the deaths file contains a useful extra column
-representing the population for each county in the dataset;
-and we certainly want to keep and use that information.
+Thankfully, the Johns Hopkins team also provides a "lookup table"
+for all locations they track which includes Population (as well as
+geographic coordiates, et al).
 
-```{r, input-deaths}
-death_data <- read_csv(
-    paste0(jhu_directory, jhu_death_filename),
-    col_types = jhu_cols
+```{r, input-lookup}
+# Get lookup data for population counts
+jhu_lookup_filename <- "UID_ISO_FIPS_LookUp_Table.csv"
+jhu_lookup_cols <- cols(
+    UID = col_double(),
+    iso2 = col_character(),
+    iso3 = col_character(),
+    code3 = col_double(),
+    FIPS = col_double(),  # override, was: col_character(),
+    Admin2 = col_character(),
+    Province_State = col_character(),
+    Country_Region = col_character(),
+    Lat = col_double(),
+    Long_ = col_double(),
+    Combined_Key = col_character(),
+    Population = col_double()
+)
+
+jhu_lookup_data <- read_csv(
+    paste0(jhu_directory, jhu_lookup_filename),
+    col_types = jhu_lookup_cols
 ) %>%
     select(
         -UID, -iso2, -iso3, -code3,
-        -Lat, -Long_,
-        Country = "Country_Region",
-        State = "Province_State",
-        County = Admin2
+        -Lat, -Long_, -Combined_Key,
+        Admin0 = "Country_Region",
+        Admin1 = "Province_State"
     ) %>%
-    select(-Country) %>%  # Country always == "US" in this dataset
-    pivot_longer(
-        -c(FIPS, County, State, Combined_Key, Population),
-        names_to = "date_str",
-        values_to = "Death"
+    filter(
+        Admin0 == "US",
+        is.na(Admin2)
     ) %>%
-    mutate(
-        Date = as.Date(date_str, "%m/%d/%y"),
-        date_str = NULL
+    select(
+        Admin1, Population
     )
 ```
 
 
 # Operate
 
-There is not much analysis in this exercise, so the operations
+Frankly, there is not much analysis in this exercise, so the operations
 we have are really just to use the many tools in the `tidyverse`
 to strip all this data down to the chart we seek.
 
-# Join Datasets
+## Join Datasets And Calculate Moving Averages
 
-Joining these datasets together
-enables us to use the same population data for both cases and deaths,
-and also leads us to a simple way to include both on the same chart.
+Joining the datasets enables us to calculate the normalized case counts,
+and as part of the same operation we can then calculate a 7-day moving
+average (which helps smooth out the sitations where some states tend to
+report fewer cases during Saturday and Sunday).
 
 ```{r, joining}
-dataset <- cases_data %>%
+jhu_workset <-
+    # Join with Lookup data to get Population
     left_join(
-        death_data, 
-        by = c("FIPS", "County", "State", "Combined_Key", "Date")
-    ) %>%
-    rename(
-        Label = "Combined_Key"
-    )
-```
-
-
-# New Cases
-
-First, we use the `lubridate` tools to calculate values for
-"new cases" -- the counts of cases new to each day,
-or in other words the difference in cumulative count
-between today and yesterday.
-
-We `arrange` the data so that the `lag()` calls will fetch
-the preceeding day's entry rather than yank a value from
-whatever item happened to fall into the preceeding row.
-
-```{r, lagging}
-workset <- dataset %>%
-    arrange(
-        State, County, Date
-    ) %>%
-    mutate(
-        NewCases = if_else(
-            County == lag(County, 1, default = ""), 
-            Cases - lag(Cases, 1, default = 0),  
-            NA_real_
-        ),
-        NewDeath = if_else(
-            County == lag(County, 1, default = ""),
-            Death - lag(Death, 1, default = 0),
-            NA_real_
-        )
-    ) 
-```
-
-The `if_else()` logic is there to prevent us from `lag()`
-returning a value that comes from a different location.
-And to avoid a possible `NA` on the first row (where there
-is no data for `lag()` to fetch), we provide a default lag value
-[but we really don't care what that value is so long as it
-doesn't match a recent date].
-
-## Where Does One Find a County Called "Unassigned"?
-
-One of the gotchas with this dataset is that not all the
-cases are assigned to a county (or any other entity where
-we have a known population).
-
-```{marginfigure, bookkeeping}
-Sigh.  Welcome to the real world.  
-The good folks at JHU CSSE are delivering an amazing resource here, 
-a few workarounds is a very small price to pay for all this.
-```
-
-Due to lapses in bookkeeping or whatever reason many states
-have reports of cases where the county is listed only as
-"Unassigned".
-Also, in other situations, states are loathe to consider
-visitors who are being treated in their state as part of
-their state's afflicted population.  Hence there are a number
-of cases listed as "Out of XX".
-
-This is a problem for our population-based analysis
-since the known population is 0, and dividing by zero
-makes a mess of our results.
-
-```{marginfigure}
-This does affect the accuracy of our analyses, but since our
-goal here is only a rough comparison chart what accuracy we still
-have should be sufficient to find if things are near or far
-from each other.  We would want to be more careful if our goal
-was dependent on the need to extract exact values.
-
-Like most real-world datasets, the accuracy of the source data
-does not support the precision built into our calculation tools.
-With the available COVID-19 testing results, there is already
-evidence anyway that the reported values of confirmed cases are
-only some unknown percentage of the  real numbers of people
-who have caught the disease (and may not know it).
-This exercise here may be sufficient for rough comparisons
-between these counties, but one needs to consider differences
-in conditions, environment, and reporting rules before 
-one attempts to draw specific conclusions from these materials.
-```
-
-The workaround used here is to sum up these "extra" cases
-state by state and later add them to whichever county has
-the highest count of cases.
-The hope is that this county is possibly the
-most likely location where these cases were found; the
-likely outcome is that these extra cases become a small
-bit of noise in the data -- the worst case is that this
-workaround will cause some county-level data on at least
-some dates to be notably distorted.
-
-```{r, extras}
-outs_data <- workset %>%
-    filter(
-        County == "Unassigned" | str_detect(County, "Out of ")
-    ) %>%
-    group_by(State, Date) %>%
-    summarise(
-        ExCases = sum(NewCases),
-        ExDeath = sum(NewDeath)
-    )
-```
-
-
-## Normalize by Population
-
-We can now add these extras to our existing values
-and then generate new values normalized per million
-in population for that county -- so all these values
-are now in terms of cases per million which makes for
-easier cross comparisons between small and large
-counties.
-
-```{r, normalize}
-workset <- workset %>%
-    # join "outs" counts as new columns of state-level data
-    left_join(outs_data, by = c("State", "Date")) %>%
-    # Now we can drop out counties with 0 or very low Population
-    # ... this will also drop out the "Unassigned" counties
-    filter(
-        Population > min_pop
-    ) %>%
-    arrange(State, Date, desc(Cases)) %>%
-    # Once sorted, the first row for each date has the most Cases
-    mutate(
-        SumCases = if_else(
-            Date != lag(Date, 1, default = 0),
-            NewCases + ExCases,
-            NewCases
-        ),
-        SumDeath = if_else(
-            Date != lag(Date, 1, default = 0),
-            NewDeath + ExDeath,
-            NewDeath
-        )
-    ) %>%
-    # Finally, calculate rates per million in population
-    mutate(
-        NormedCases = if_else(
-            NewCases > 0,
-            NewCases / (Population / 1000000),
-            NA_real_
-        ),
-        NormedDeath = if_else(
-            NewDeath > 0,
-            NewDeath / (Population / 1000000),
-            NA_real_
-        )
+        jhu_uscases_data, jhu_lookup_data,
+        by = "Admin1"
     ) %>%
     select(
-        -Cases, -Death,
-        -NewCases, -NewDeath,
-        -SumCases, -SumDeath,
-        -ExCases, -ExDeath
+        Name = Admin1, Population, Date, Cases
+    ) %>%
+    # Convert running totals into daily new cases and generate running average
+    group_by(Name) %>%
+    arrange(Date) %>%
+    mutate(
+        NewCases = Cases - lag(Cases),
+        AvgCases = slide_dbl(
+            NewCases, mean,
+            .before = before_count, .complete = TRUE
+        ),
+        NrmAvgCases = AvgCases / (Population / 1000000),
+        RelCases = NrmAvgCases / last(NrmAvgCases)
+    ) %>%
+    # Reduce to simplify
+    ungroup() %>%
+    select(
+        Date, Name, AvgCases, NrmAvgCases, RelCases
     )
 ```
 
 
-## Find the Counties with Highest Peaks
+## Min and Max Cases
 
-Rather than display the thousands of counties in the US,
-this chart will be based on just a few of those with highest
-rates (cases per million).
-[The number of counties included is based on the
-`max_counties` value set in the Configuration section
-at the top of this file.]
+First, the `lubridate` tools in Tidyverse help keep data calculations
+clean, but it's more out of habit than necessity that I use the library
+just to figure out a date for exactly one month ago.
 
-```{r, filter}
-filter_keys <- workset %>%
-    group_by(Label, Date) %>%
-    summarise(peak = max(NormedCases)) %>%
-    arrange(desc(peak)) %>%
-    pull(Label) %>%
-    unique() %>%
-    head(max_counties)
-```
+The "neat" trick is in the second step, using the new `slice` functions
+in the updated `dplyr` library to neatly extract exactly one date each
+for when min and max values were reached.
 
-## Final Details
-
-Finally, we produce a minimal "viewset" with just the data we'll display --
-`ggplot()` is already doing a lot of work, it may help to avoid
-slogging a data frame replete with a wide variety of unneeded values.
-
-```{r, viewset}
-viewset <- workset %>%
-    # Just include the countries in the desired list
+```{r, min-max}
+# Filter down to just the dates that are of interest
+latest_date <- max(jhu_workset$Date)
+chart_start_date <- latest_date - months(1, FALSE)
+viewset <- jhu_workset %>%
     filter(
-        Label %in% filter_keys
+        NrmAvgCases > 0,
+        Date > chart_start_date
+    )
+
+# Find the min and max for each state now that we've removed unwanted dates
+min_dates <- viewset %>%
+    group_by(Name) %>%
+    slice_min(RelCases, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(Name, MinDate = Date, MinVal = AvgCases)
+max_dates <- viewset %>%
+    group_by(Name) %>%
+    slice_max(RelCases, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(Name, MaxDate = Date, MaxVal = AvgCases)
+
+# Join the min/max to our data, and generate a label for those min/max dates
+viewset <- viewset %>%
+    left_join(min_dates, by = "Name") %>%
+    left_join(max_dates, by = "Name") %>%
+    # Generate a label for the datapoints on the specific min/max dates
+    group_by(Name) %>%
+    mutate(
+        Label = if_else(
+            Date == MaxDate,
+            as.character(round(MaxVal)),
+            if_else(
+                Date == MinDate,
+                as.character(round(MinVal)),
+                ""
+            ),
+        )
     ) %>%
-    # Drop out any rows that won't display anyway
-    filter(
-        !is.na(NormedCases),
-        NormedCases > 0.01
-    ) %>%
-    # Drop out any columns not displayed
+    # Reduce back down to just what we need
+    ungroup() %>%
     select(
-        -FIPS, -County, -State
+        -AvgCases,
+        -MinVal, -MaxVal, -MinDate, -MaxDate
     )
 ```
 
@@ -435,96 +352,301 @@ Using the many features of ``ggplot()``
 we can build a very complex chart
 showing small-multiples of each counties' case rates over time.
 
-The "Cases" data are the primary aesthetic and
-will show up as sequences of colored dots on each chart, 
-with the color representing the scale of the
-population in that county.
+## Simple Faceting
 
-The "Death" data is referenced in the second `geom_point()` 
-and will show up as much smaller red dots
-trailing underneath the "Cases" points.
+Each chart is displaying the same sequence of days across the X-axis,
+and each is displaying the same Y-axis relative to the last day's value
+(the Y-axis runs from 0 to 2 with the last day's value centered at 1.0
+and all the other points displayed relative to that last point).
+In this way the shapes of the curves are easily compared.
 
-The legend has been tweaked pretty seriously to enable a
-tertiary comparison of the relative sizes of the counties
-displayed.  This legend is based on a `log10` transform
-of the `Population` column using the vivid Viridis
+The shape of the curve in each chart
+provides a sense of the recent directions of
+each state's trends, but the color of the datapoints can provide an idea
+of how serious the situation might be, with the "hotter" the color the
+higher the number of cases per million residents of that state.
+The legend has been tweaked pretty seriously, using
+a `log10` transform of the `Population` column with the vivid Viridis
 color scale -- reworking the scale by orders of magnitude
-makes it is possible to get a reasonable sense of each county's
-size even in the tiny subplots within the small-multiple view.
+makes it is possible to get a reasonable sense of each state's
+outbreak even in the tiny subplots within the small-multiple view.
 The legend itself has been hacked with calls to `guides()` and `theme()`
 to render a long and thin legend along the bottom of the chart
 which may make it easier to see how to read the
 colors of the counties while taking only a bit of visual room.
 
-```{r, chart, fig.fullwidth=TRUE, fig.width=10}
-g <- ggplot(
+To supply some detailed information from each state, the min and the max
+values for each chart are noted and the exact values for those are
+printed in small type for those who may want to squint.
+
+```{r, chart, fig.height=8}
+gg <- ggplot(
     viewset,
     aes(
         x = Date,
-        y = NormedCases,
-        color = Population
-    )
+        y = RelCases,
+        label = Label,
+        color = NrmAvgCases
+        )
 ) +
-    geom_point(na.rm = TRUE) +
+    # lay down one reference line
+    geom_hline(
+        yintercept = 1.0,
+        color = "gray90",
+        size = 0.5
+    ) +
+    # add our data
     geom_point(
-        aes(y = NormedDeath),
-        size = 0.25,
-        color = "red",
+        size = 1,
         na.rm = TRUE
     ) +
+    # Style the chart
+    coord_cartesian(
+        ylim = c(0, UPPER_BOUND)
+    ) +
     scale_x_date(
-        minor_breaks = NULL
+        date_breaks = "1 month",
+        date_labels = "%b"
     ) +
-    scale_y_log10(
-        labels = label_comma(accuracy = 1),
-        minor_breaks = NULL
-    ) +
-    facet_wrap(~fct_relevel(Label, filter_keys)) +
     scale_color_viridis_c(
-        option = "D",
         trans = "log10",
-        labels = label_comma()
+        n.breaks = 7, breaks = waiver(),
+        option = "A", direction = 1
     ) +
     guides(
         color = guide_colorbar(
             barwidth = unit(0.75, "npc"),
             barheight = unit(0.01, "npc"),
-            title = "County Population"
+            title = "Cases/Million (log scale)"
         )
     ) +
+    geom_text_repel(
+        min.segment.length = unit(0, 'lines'), 
+        size = 2,
+        color = "black"
+    ) +
+    facet_wrap(~ Name) +
     labs(
-        title = "COVID-19: Daily Counts of Confirmed Cases (and deaths) Normalized by Population",
+        title = "COVID By US State: Last Month of New Cases Reported per Day",
         subtitle = paste(
-            max_counties,
-            "of the US Counties with the Highest Levels of Cases per Million in Population"
+            "Daily Cases Plotted Relative to Latest Counts,",
+            "Colored by Daily Cases per Million Population"
         ),
-        x = NULL,
-        y = "Daily Count of Cases (and deaths) per Million Population (log scale)",
+        y = "New Cases Reported (7-day moving average)",
+        x = "",
         caption = paste(
-            "COVID-19 Data from Johns Hopkins University CSSE as of",
-            format(max(viewset$Date), "%A, %B %e, %Y")
+            "Visualization by Alexander Carlton;",
+            "Data from Johns Hopkins University CSSE,",
+            "including data through",
+            format(latest_date, "%B %e, %Y")
         )
     ) +
     theme_minimal() +
     theme(
+        plot.background = element_rect(
+            fill = "gray90", color = "gray90"
+        ),
+        strip.background = element_rect(
+            fill = "white", color = "white"
+        ),
+        panel.background = element_rect(
+            fill = "white", color = "white"
+        ),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
         axis.text.x = element_text(angle = 90, vjust = 0.5),
+        axis.text.y = element_blank(),
         legend.position = "bottom"
     )
-print(g)
+
+print(gg)
 ```
 
-Clearly this is a very busy graphic, but it helped address the question
-I was investigating at the time (comparing how my local county compared
-to other counties, large and small, regarding where we were on the curve).
-Reviewing this chart over time can show which counties are still facing
-the difficulties of rapid case growth and which appear to be experiencing
-improving conditions.
+These charts are all drawn normalized to each other,
+all with the last date falling on the mid-point of the Y-axis.
+And unfortunately, almost all of these charts are rising to that last date
+showing that the peak values over the last month has been reached only recently.
+Hawaii is the one case where it's easy to see the trend all month has been
+downwards.
 
-And, perhaps more importantly, working through this exercise proved to be
+## Adapting the Layout to Provide More Information
+
+Displaying these charts alphabetically is efficient space-wise,
+but a bit hard to appreciate visually.
+We can take advantage of peoples' familiarity with the basic layout of
+the states in America to re-arrange these charts in such a way that one
+can get a quick sense of regional differences.
+
+The `geofacet` library can be fun to work with.
+Obviously there are severe limits to the accuracy of any attempt to
+replicate geographic complexity with nothing more than a set of identically
+sized rectangles, but even with all the distortions a decent layout of
+these charts can provide a good means of delivering some insights about
+regional behavior.
+
+### Defining a Layout
+
+The `geofacet` library comes with many pre-existing layouts, but
+depending upon one's needs sometimes it is better to define your own
+(or perhaps just tweak one of the existing layouts to better suit your
+data).
+
+```{r, grid}
+# Define an arrangement of states into a grid layout for facet_geo()
+unitedstates_grid <- data.frame(
+    row = c(
+                                   1, 1, 1,
+        2, 2, 2, 2, 2, 2, 2,    2, 2, 2, 2,
+        3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+           5, 5, 5, 5, 5, 5, 5,
+                 6, 6, 6, 6, 6,          6,
+        7, 7,    7,          7,          7
+    ),
+    col = c(
+                                   10, 11, 12,
+        1, 2, 3, 4, 5, 6, 7,    9, 10, 11, 12, 
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+           2, 3, 4, 5, 6, 7, 8,
+                 4, 5, 6, 7, 8,            12, 
+        1, 2,    4,          8,            12
+    ),
+    code = c(
+                                                              "VT", "NH", "ME",
+        "WA", "ID", "MT", "ND", "MN", "WI", "MI",       "NY", "CT", "RI", "MA", 
+        "OR", "NV", "WY", "SD", "IA", "IL", "IN", "OH", "PA", "NJ",
+        "CA", "UT", "CO", "NE", "MO", "KY", "WV", "VA", "MD", "DE",
+              "AZ", "NM", "KS", "AR", "TN", "NC", "SC",
+                          "OK", "LA", "MS", "AL", "GA",                   "DC",
+        "AK", "HI",       "TX",                   "FL",                   "PR"
+    ),
+    name = c(
+        "Vermont", "New Hampshire", "Maine",
+        "Washington", "Idaho", "Montana", "North Dakota", "Minnesota",
+            "Wisconsin", "Michigan", "New York", "Connecticut", "Rhode Island", 
+            "Massachusetts",
+        "Oregon", "Nevada", "Wyoming", "South Dakota", "Iowa", "Illinois",
+            "Indiana", "Ohio", "Pennsylvania", "New Jersey",
+        "California", "Utah", "Colorado", "Nebraska", "Missouri", "Kentucky",
+            "West Virginia", "Virginia", "Maryland", "Delaware",
+        "Arizona", "New Mexico", "Kansas", "Arkansas", "Tennessee", 
+            "North Carolina", "South Carolina",
+        "Oklahoma", "Louisiana", "Mississippi", "Alabama", "Georgia",
+            "District of Columbia",
+        "Alaska", "Hawaii", "Texas", "Florida", "Puerto Rico"
+    ),
+    stringsAsFactors = FALSE
+)
+```
+
+### Rebuilding the Chart
+
+Below we repeat this same small-multiples chart, just substituting
+a call to `facet_geo()` instead of `facet_wrap()`.
+
+```{r, geo, fig.fullwidth=TRUE, fig.width=10, fig.height=8, message=FALSE}
+# Generate the plot
+geo <- ggplot(
+    viewset,
+    aes(
+        x = Date,
+        y = RelCases,
+        label = Label,
+        color = NrmAvgCases
+        )
+) +
+    # lay down one reference line
+    geom_hline(
+        yintercept = 1.0,
+        color = "gray90",
+        size = 0.5
+    ) +
+    # add our data
+    geom_point(
+        size = 1,
+        na.rm = TRUE
+    ) +
+    # Style the chart
+    coord_cartesian(
+        ylim = c(0, UPPER_BOUND)
+    ) +
+    scale_x_date(
+        date_breaks = "1 month",
+        date_labels = "%b"
+    ) +
+    scale_color_viridis_c(
+        trans = "log10",
+        n.breaks = 7, breaks = waiver(),
+        option = "A", direction = 1
+    ) +
+    guides(
+        color = guide_colorbar(
+            barwidth = unit(0.75, "npc"),
+            barheight = unit(0.01, "npc"),
+            title = "Cases/Million (log scale)"
+        )
+    ) +
+    geom_text_repel(
+        min.segment.length = unit(0, 'lines'), 
+        size = 2,
+        color = "black"
+    ) +
+    facet_geo(
+        ~ Name,
+        grid = unitedstates_grid,
+        move_axes = FALSE
+    ) +
+    labs(
+        title = "COVID By US State: Last Month of New Cases Reported per Day",
+        subtitle = paste(
+            "Daily Cases Plotted Relative to Latest Counts,",
+            "Colored by Daily Cases per Million Population"
+        ),
+        y = "New Cases Reported (7-day moving average)",
+        x = "",
+        caption = paste(
+            "Visualization by Alexander Carlton;",
+            "Data from Johns Hopkins University CSSE,",
+            "including data through",
+            format(latest_date, "%B %e, %Y")
+        )
+    ) +
+    theme_minimal() +
+    theme(
+        plot.background = element_rect(
+            fill = "gray90", color = "gray90"
+        ),
+        strip.background = element_rect(
+            fill = "white", color = "white"
+        ),
+        panel.background = element_rect(
+            fill = "white", color = "white"
+        ),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5),
+        axis.text.y = element_blank(),
+        legend.position = "bottom"
+    )
+
+print(geo)
+```
+
+Clearly this is not an accurate map of the United States, but it is enough
+to show that the overall upward trends are true almost coast to coast,
+though northern New England and the West Coast states both look different
+than their neighboring regions, and that the Dakotas appear to be at the
+center of an area currently experiencing a rapidly rising caseload.
+
+
+# Closing Thoughts
+
+At least for me, working through this exercise proved to be
 a very good opportunity to become more familiar with several
 tidyverse features that hadn't yet become a part of my usual processes.
 
 I hope at least something here was helpful.
 This and some of my other exercises are part of a
-[Neat And Tidy](https://www.fisodd/code/neat-and-tidy) project
+[Neat And Tidy](https://www.fisodd.com/code/neat-and-tidy) project
 with code shared in [my GitHub](https://github.com/fisodd/neat-and-tidy).

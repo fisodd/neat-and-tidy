@@ -2,7 +2,7 @@
 title: "Neat and Tidy: Mapping COVID-19 Data with Tidyverse"
 subtitle: "Animating choropleths with 'urbnmapr' and 'gganimate'"
 author: "Alexander Carlton"
-date: "2020-04-13"
+date: "2020-04-13, Updated 2020-11-03"
 output:
   tufte::tufte_html:
     tufte_variant: "envisioned"
@@ -46,6 +46,7 @@ A great tool improves the way you think.
 ```{r env, results='hide', message=FALSE}
 library(tidyverse)
 library(gganimate)
+library(ggthemes)
 library(urbnmapr)
 library(scales)
 library(gifski)
@@ -57,13 +58,15 @@ A few parameters for controling or adapting this script
 to suit the local needs.
 
 ```{r config}
+# Define a time-period to animate
+start_date <- as.Date("2020-01-22")
+end_date <- as.Date("2020-11-03")
+
 # This file will be created at the end
 output_filename <- "animation.gif"
 
 # The following are based on the local copy of the data
-jhu_directory <- "COVID-19/csse_covid_19_data/csse_covid_19_time_series/"
-jhu_cases_filename <- "time_series_covid19_confirmed_US.csv"
-jhu_death_filename <- "time_series_covid19_deaths_US.csv"
+jhu_directory <- "COVID-19/csse_covid_19_data/"
 
 # Minimum population to include in map (tiny populations can have difficult variance)
 min_pop <- 10000
@@ -74,9 +77,7 @@ min_pop <- 10000
 
 Amongst the many files provided in this repository,
 our immediate focus are the time_series files,
-specifically the ones for the US:
-the one tracking Confirmed Cases
-and the one tracking Deaths.
+specifically the one for tracking Confirmed Cases in the US.
 
 ```{marginfigure}
 The [COVID-19 repository](https://github.com/CSSEGISandData/COVID-19)
@@ -89,8 +90,9 @@ so many others to learn.  We are very grateful.
 ```
 
 ```{r inputs}
-# Fetch JHU data
-jhu_cols <- cols(
+jhu_uscases_filename <- "csse_covid_19_time_series/time_series_covid19_confirmed_US.csv"
+# Fetch the US cases data
+jhu_uscases_cols <- cols(
     .default = col_double(),
     UID = col_character(),
     iso2 = col_character(),
@@ -102,28 +104,16 @@ jhu_cols <- cols(
     Combined_Key = col_character()
 )
 
-# Fetch the Cases and then the Death data
-jhu_cases_data <- read_csv(
-    paste0(jhu_directory, jhu_cases_filename),
-    col_types = jhu_cols
+jhu_uscases_data <- read_csv(
+    paste0(jhu_directory, jhu_uscases_filename),
+    col_types = jhu_uscases_cols
 ) %>%
     select(
-        -UID, -iso2, -iso3, -code3, -Lat, -Long_, -Country_Region
+        -UID, -iso2, -iso3, -code3, -Lat, -Long_
     ) %>%
     rename(
-        County = "Admin2",
-        State = "Province_State"
-    )
-jhu_death_data <- read_csv(
-    paste0(jhu_directory, jhu_death_filename),
-    col_types = jhu_cols
-) %>%
-    select(
-        -UID, -iso2, -iso3, -code3, -Lat, -Long_, -Country_Region
-    ) %>%
-    rename(
-        County = "Admin2",
-        State = "Province_State"
+        Admin1 = "Province_State",
+        Admin0 = "Country_Region"
     )
 ```
 
@@ -132,56 +122,81 @@ For our use here we need to transform these spreadsheets into tidy data.
 
 While we are at it, we process the "FIPS" values (which are a set of
 standardized labels for each county in the US) into a form that
-makes life much easier later, when we join with our mapping points.
+is easier to later join with our source for geographic mapping info.
 
 ```{r make-tidy}
 # Turn the JHU data into a 'tidy' form (with a proper Date field)
-tidy_cases_data <- jhu_cases_data %>% 
+tidy_cases_data <- jhu_uscases_data %>% 
     pivot_longer(
-        -c(County, State, Combined_Key, FIPS),
+        cols = contains("/"),
         names_to = "date_str",
         values_to = "Cases"
     ) %>%
     mutate(
+        # Convert date field into a native form
         Date = as.Date(date_str, "%m/%d/%y"),
-        date_str = NULL,
-        county_fips = sprintf("%05d", as.integer(FIPS)),
-        FIPS = NULL
-    )
-tidy_death_data <- jhu_death_data %>% 
-    pivot_longer(
-        -c(County, State, Combined_Key, Population, FIPS),
-        names_to = "date_str",
-        values_to = "Death"
-    ) %>%
-    mutate(
-        Date = as.Date(date_str, "%m/%d/%y"),
-        date_str = NULL,
-        county_fips = sprintf("%05d", as.integer(FIPS)),
-        FIPS = NULL
+        date_str = NULL
     )
 ```
 
 Then once we have the data in tidy form,
-it is easy to manipulate it into what we need.
+it is easy to manipulate it and learn from the results.
 
-Joining the Cases and the Deaths together allows an analysis of morbidity,
-but in this case it also happens to bring in a column of Population data
-from the Deaths file that is very useful for the Cases data.
+Now, in order to be able to normalize the case data by county population
+we need to join in the population information from a lookup table also
+provided in the Johns Hopkins dataset.
 
 ```{r joining}
-# Joining also gives us a Population field to use
-tidy_data <- tidy_cases_data %>%
+# Get lookup data for population counts
+jhu_lookup_filename <- "UID_ISO_FIPS_LookUp_Table.csv"
+jhu_lookup_cols <- cols(
+    UID = col_double(),
+    iso2 = col_character(),
+    iso3 = col_character(),
+    code3 = col_double(),
+    FIPS = col_double(),  # override, was: col_character(),
+    Admin2 = col_character(),
+    Province_State = col_character(),
+    Country_Region = col_character(),
+    Lat = col_double(),
+    Long_ = col_double(),
+    Combined_Key = col_character(),
+    Population = col_double()
+)
+
+jhu_lookup_data <- read_csv(
+    paste0(jhu_directory, jhu_lookup_filename),
+    col_types = jhu_lookup_cols
+) %>%
+    select(
+        -UID, -iso2, -iso3, -code3,
+        -Lat, -Long_, -Combined_Key,
+        Admin0 = "Country_Region",
+        Admin1 = "Province_State"
+    ) %>%
+    filter(
+        Admin0 == "US",
+        is.na(Admin2)
+    ) %>%
+    select(
+        Admin1, Population
+    )
+
+jhu_workset <-
+    # Join with Lookup data to get Population
     left_join(
-        tidy_death_data, 
-        by = c("County", "State", "Combined_Key", "county_fips", "Date")
+        tidy_cases_data, jhu_lookup_data,
+        by = "Admin1"
+    ) %>%
+    select(
+        FIPS, Admin1, Admin2, Population, Date, Cases
     )
 ```
 
 # Operate
 
-Since we are focused on mapmaking, we can remove the entries that don't
-fit into our maps.
+Since this exercise is focused on mapmaking,
+we can remove the entries that don't fit into our maps.
 
 ```{marginfigure}
 Yes, there's a degree of inaccuracy created by just
@@ -192,14 +207,14 @@ does any serious analysis.
 ```
 
 ```{r operate}
-dataset <- tidy_data %>%
+dataset <- jhu_workset %>%
     filter(
-        !County == "Unassigned",
-        !str_detect(County, "Out of "),
+        !Admin2 == "Unassigned",
+        !str_detect(Admin2, "Out of "),
         Population > min_pop # Drops the cruise ships and tiny principalities
     ) %>%
     mutate(
-        value = if_else(
+        Value = if_else(
             Cases != 0,
             Cases / (Population / 1000000),
             NA_real_  # For display purposes, convert '0' to 'na' (white out)
@@ -220,28 +235,24 @@ so the more we can eliminate now
 the less stuff the plot needs to grind through
 when making each image.
 Something that can be appreciated when we
-need to grind through a hundred images
-to make an animation.
+need to grind out an animation with hundreds of images
+each built out of thousands of counties.
 
 ```{r minimize}
-# Note: these could be customized...
-start_date <- min(dataset$Date)
-end_date <- max(dataset$Date)
-
-# join desired data with map points and then drop the unneeded cols
-mapset <- dataset %>%
+# prepare the data for joining with the map definitions
+dataset <- dataset %>%
     filter(
         Date >= start_date,
         Date <= end_date
     ) %>%
     mutate(
-        region = tolower(State),
-        subregion = tolower(County)
+        region = tolower(Admin1),
+        subregion = tolower(Admin2),
+        # Convert FIPS to a form that will join with the map data
+        county_fips = sprintf("%05d", as.integer(FIPS))
     ) %>%
     select(
-        -Combined_Key,
-        -County, -State,
-        -Cases, -Death, -Population
+        Date, Value, region, subregion, county_fips
     )
 ```
 
@@ -255,15 +266,18 @@ between accuracy and usefulness.
 For this exercise the county-level information as provided by
 `urbnmapr` (the very handy US map assistant from the Urban Institute team)
 provides just what we need [border points to draw at both the county
-and at the state level precalculated with a transform that pulls
-Alaska and Hawaii across the Pacific to nestle in where the real world
-has Baja California -- not necessarily accurate, but effective and
+and at the state level precalculated with a transform like the old
+school classroom maps of the USA that pulls Alaska and Hawaii
+across the Pacific to be overlayed where the real world has Baja California --
+not necessarily accurate, but effective and
 very recognizable for a US audience].
 
 
-```{r mapinfo}
-mapinfo <- mapset %>%
-    right_join(urbnmapr::counties, by = "county_fips")
+```{r plotdata}
+state_info <- get_urbn_map("states", sf = TRUE)
+county_info <- get_urbn_map("counties", sf = TRUE)
+plotdata <- dataset %>%
+    right_join(county_info, by = "county_fips")
 ```
 
 # Display
@@ -272,7 +286,7 @@ Lots of functions with lots of arguments,
 but mostly this is just for style.
 
 The one tricky item here is the coloring of the counties.
-This chart uses `scale_fill_viridis_c` for coloring,
+This chart uses a continuous three-color palette for coloring,
 but here we specify a "log10" transformation
 (linear distance along this color line represents changes of
 orders of magnitude in cases per million in population)
@@ -282,45 +296,50 @@ don't force everywhere else into a dull monotone.
 ```{marginfigure}
 As was touched on when dropping the "unassigned" values above,
 this is another area where one needs to be careful.
-The `log10` function is an exaggeration, and while exaggeration is a powerful
+The `log10` function is an exaggeration,
+and while exaggeration is a powerful
 tool to pull attention to the selected area of interest,
 there comes a point where it is difficult (if not impossible)
 to differentiate between an overdone exaggeration and a simple lie.
 ```
 
+In this chart, very low counts per million will be in shades of yellow,
+then the colors will shift through shades of orange as the case rates
+rise into the hundreds of cases per million in local population, and
+finally into deeper and deeper shades of red as cases reach up through
+tens of thousands cases per million inhabitants.
+
 ```{r ggplot}
 # Use the last date with values as a proxy for a timestamp for the dataset
-last_date <- max(tidy_data$Date)
+last_date <- max(plotdata$Date)
 
 # Build the plot
-g <- ggplot() +
+gg <- ggplot() +
     # County-level data
-    geom_polygon(
-        data = mapinfo,
-        mapping = aes(x = long, y = lat, group = group, fill = value),
+    geom_sf(
+        data = plotdata,
+        mapping = aes(fill = Value, geometry = geometry),
         color = NA
     ) +
     # Colored brightly
-    scale_fill_viridis_c(
-        name = "Cases per Million",
-        trans = "log10", # bring out differences of less afflected counties
+    scale_fill_distiller(
+        palette = "YlOrRd",
+        direction = 1,
+        na.value = "#ffffdd",
+        trans = "log10",
         n.breaks = 5,
         labels = label_comma(),
-        na.value = "white",
-        option = "C"
+        name = "Cases per Million",
+        guide = "colorbar"
     ) +
     # State outlines
-    geom_polygon(
-        data = urbnmapr::states,
-        mapping = aes(long, lat, group = group),
+    geom_sf(
+        data = state_info,
+        mapping = aes(geometry = geometry),
         fill = NA,
         color = "black",
         size = 0.4
     ) +
-    # projected in a reasonable manner for a decent map
-    coord_map("albers", lat0 = 45.5, lat1 = 29.5) +
-    scale_x_continuous(breaks = NULL) +
-    scale_y_continuous(breaks = NULL) +
     # Hack the legend to be wide across the bottom of the chart
     guides(
         fill = guide_colorbar(
@@ -337,19 +356,19 @@ g <- ggplot() +
         y = NULL
     ) +
     # Clean theme, but do push the legend/guide to be displayed below chart
-    theme_minimal() +
+    theme_map() +
     theme(
         legend.title = element_text(vjust = 1),
         legend.position = "bottom"
     ) 
-print(g)
+print(gg)
 ```
 
 And we have our base chart.
 
-Yes, it looks very bare with only one reported case in Washington.
-But that's only how things started, the map will look very different
-as we move forward in time.
+Actually, this is a display of how things will look
+at the end of the sequence of frames.
+The map will look very different as we move forward in time.
 
 # Animate
 
@@ -371,17 +390,21 @@ will be replaced by the current date as is generated by the
 `transition_time()` function.
 
 ```{r anim, results='hide', message=FALSE, warning=FALSE}
-# Note: this can take a while to execute
-# -- many days of data
-# -- lots and lots of (border) points in every image
+# Note: this can take a long time to execute
+# -- many days of data, lots and lots of geometry points in every image
+
+# At one frame for each day, count up how many frames we need
+size_of_dates <- plotdata %>% select(Date) %>% unique() %>% dim()
+nframes = size_of_dates[1]
 
 # Animate by Date
-anim <- g +
+anim <- gg +
     transition_time(Date, range = c(start_date, end_date))
 loop <- animate(
     anim,
-    nframes = 100, fps = 10, # 10 second clip
-    end_pause = 30 # hold still for last 30 frames (3 secs)
+    fps = 10,           # 10 frames per second
+    nframes = nframes,  # animate with 1 frame each day
+    end_pause = 30      # hold still for last 30 frames (3 secs)
 )
 anim_save(output_filename)
 ```
