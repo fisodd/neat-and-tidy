@@ -1,5 +1,5 @@
 ---
-title: "Clean and Tidy: Using Tidyverse to Manage COVID-19 Data"
+title: "Neat and Tidy: Using Tidyverse to Manage COVID-19 Data"
 subtitle: "Generating Small-Multiple Charts of Cases in the US Using the JHU CSSE COVID-19 Dataset"
 author: "Alexander Carlton"
 date: "2020-04-09, Updated 2020-11-01"
@@ -26,7 +26,7 @@ of an immediately useful dataset -- and wonderfully they have
 so that everyone can work with the numbers
 until we each find the best ways to make sense of all this.
 
-```{marginfigure, clean-tidy}
+```{marginfigure, neat-tidy}
 [Neat and Tidy](https://www.fisodd.com/code/neat-and-tidy)
 is a place where I have collected a variety of lessons I have
 learned as have explored the power of the
